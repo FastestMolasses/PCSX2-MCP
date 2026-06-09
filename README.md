@@ -9,6 +9,10 @@
 > **Control a PS2 emulator from your AI coding assistant.**
 > Set breakpoints, read registers, disassemble MIPS, inspect memory — all via MCP tools.
 
+> **Platforms:** the MCP server (Node.js) runs on **Windows, macOS, and Linux**. The DebugServer
+> plugin is cross-platform C++ — on macOS/Linux you build it into PCSX2 yourself (see
+> [Building from Source](#building-from-source)). The pre-built release zip is Windows-only.
+
 ```
 ┌─────────────┐    stdio (MCP)    ┌─────────────────────┐    TCP:21512    ┌─────────────────┐
 │ AI Assistant │ ◄──────────────► │  pcsx2-mcp-server   │ ◄────────────► │  PCSX2 Emulator │
@@ -31,7 +35,7 @@
 | **PCSX2 full source** | ❌ Not included (see [upstream](https://github.com/PCSX2/pcsx2)) | ❌ Not included |
 | **DebugServer patch** | ✅ `pcsx2-plugin/DebugServer.cpp` + `.h` | ✅ Included (already compiled in) |
 | **MCP server source** | ✅ `pcsx2-mcp-server/src/` | ✅ Pre-built `dist/` + `node_modules/` |
-| **Setup script** | ✅ `setup-mcp.bat` | ✅ Included |
+| **Setup script** | ✅ `setup-mcp.bat` (Win) + `setup-mcp.sh` (macOS/Linux) | ✅ Included |
 
 **Want to just USE it?** → Download the **[latest Release](../../releases)** zip. Everything is pre-built.
 
@@ -47,15 +51,23 @@ Grab the latest release from [GitHub Releases](../../releases) — extract the z
 
 ### 2. Setup
 
-Run `setup-mcp.bat` — it checks Node.js and writes the MCP config for you.
+- **Windows:** run `setup-mcp.bat`
+- **macOS / Linux:** run `./setup-mcp.sh` — interactive; pick Claude Code (CLI), Claude Desktop, Cursor, and/or VS Code
 
-> **Requires [Node.js](https://nodejs.org/) ≥ 18.** The setup script will tell you if it's missing.
+Both check Node.js, build the server if needed, and write the MCP config for you.
+
+> **Requires [Node.js](https://nodejs.org/) ≥ 18** (`brew install node` on macOS). The setup script will tell you if it's missing.
+
+To enable the `ps2recomp_*` tools, point the server at your PS2Recomp project:
+```bash
+PS2RECOMP_ROOT=/path/to/PS2Recomp ./setup-mcp.sh
+```
 
 ### 3. Use
 
-1. Launch `pcsx2-qt.exe` from the extracted folder
+1. Launch PCSX2 (`pcsx2-qt.exe` on Windows, or your macOS/Linux build with the DebugServer patch)
 2. Load a PS2 game (ISO or disc)
-3. Restart your AI assistant (Antigravity / Claude Desktop)
+3. Restart your AI assistant (Claude Code / Claude Desktop / Cursor / Antigravity)
 4. Ask: *"Connect to PCSX2 and show me the thread list"*
 
 That's it! Your AI assistant now has **30 debugging tools** for PS2.
@@ -64,7 +76,35 @@ That's it! Your AI assistant now has **30 debugging tools** for PS2.
 
 ## Manual MCP Configuration
 
-If `setup-mcp.bat` doesn't work or you want to configure manually:
+If the setup script doesn't work or you want to configure manually. On macOS/Linux use the
+absolute path to `dist/index.js` (e.g. `/Users/you/PCSX2-MCP/pcsx2-mcp-server/dist/index.js`).
+
+<details>
+<summary><b>Claude Code (CLI)</b></summary>
+
+```bash
+claude mcp add pcsx2 --scope user -- node /absolute/path/to/pcsx2-mcp-server/dist/index.js
+# optional: enable the ps2recomp_* tools
+claude mcp add pcsx2 --scope user --env PS2RECOMP_ROOT=/path/to/PS2Recomp -- node /absolute/path/to/pcsx2-mcp-server/dist/index.js
+```
+</details>
+
+<details>
+<summary><b>Cursor</b></summary>
+
+Edit `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "pcsx2": {
+      "command": "node",
+      "args": ["/absolute/path/to/pcsx2-mcp-server/dist/index.js"]
+    }
+  }
+}
+```
+</details>
 
 <details>
 <summary><b>Antigravity / Gemini</b></summary>
@@ -87,7 +127,7 @@ Edit `~/.gemini/antigravity/mcp_config.json`:
 <details>
 <summary><b>Claude Desktop</b></summary>
 
-Edit `%APPDATA%\Claude\claude_desktop_config.json`:
+Edit your config file — Windows: `%APPDATA%\Claude\claude_desktop_config.json`; macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -253,7 +293,8 @@ PCSX2-MCP/                       ← source code only, lightweight
 │   ├── package.json
 │   └── tsconfig.json
 ├── README.md
-├── setup-mcp.bat
+├── setup-mcp.bat               ← Windows setup
+├── setup-mcp.sh                ← macOS / Linux setup
 └── package-release.ps1
 ```
 
@@ -285,12 +326,17 @@ PCSX2-MCP-v1.0.0-win64/          ← ready to run, everything pre-built
 
 | Component | Requires |
 |---|---|
-| **PCSX2** | Git, CMake ≥ 3.22, Ninja, MSVC (Visual Studio 2022), Qt 6 |
+| **PCSX2 (Windows)** | Git, CMake ≥ 3.22, Ninja, MSVC (Visual Studio 2022), Qt 6 |
+| **PCSX2 (macOS)** | Xcode command-line tools, [Homebrew](https://brew.sh/), CMake ≥ 3.22, Ninja, Qt 6, Molten-VK — see [PCSX2's macOS build guide](https://github.com/PCSX2/pcsx2#building) |
 | **MCP Server** | [Node.js](https://nodejs.org/) ≥ 18 (includes npm) |
 
 > All MCP server dependencies (`@modelcontextprotocol/sdk`, `zod`, `typescript`) are declared in `package.json` and installed automatically by `npm install`. You do **not** need to install them manually.
 
-### PCSX2
+> **The DebugServer plugin is already cross-platform.** `DebugServer.cpp` guards its socket
+> code with `#ifdef _WIN32` (Winsock) vs. POSIX (`sys/socket.h`), so it compiles unchanged on
+> macOS and Linux. You only need to build PCSX2 itself for your platform with the file added.
+
+### PCSX2 — Windows
 
 ```powershell
 # 1. Clone the upstream PCSX2 source (we don't include it in this repo to save space)
@@ -308,6 +354,39 @@ cp ../pcsx2-plugin/DebugServer.h pcsx2/DebugTools/
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target pcsx2-qt
 ```
+
+### PCSX2 — macOS
+
+PCSX2 on Apple Silicon / Intel Macs builds as `PCSX2.app`. Follow upstream's
+[macOS instructions](https://github.com/PCSX2/pcsx2) for the toolchain/dependencies, then add
+our patch before configuring:
+
+```bash
+# 1. Install build deps (one-time)
+brew install cmake ninja qt@6 molten-vk
+
+# 2. Clone upstream PCSX2 (1 GB — not bundled in this repo)
+git clone https://github.com/PCSX2/pcsx2.git pcsx2-src
+cd pcsx2-src
+
+# 3. Copy our cross-platform DebugServer patch into the source tree
+cp ../pcsx2-plugin/DebugServer.cpp pcsx2/DebugTools/
+cp ../pcsx2-plugin/DebugServer.h   pcsx2/DebugTools/
+
+# 4. Register the files with the build. In pcsx2/CMakeLists.txt, find the
+#    DebugTools source list (search for "DebugTools/DebugInterface.cpp") and add:
+#        DebugTools/DebugServer.cpp
+#        DebugTools/DebugServer.h
+#    Then call DebugServer::Start(21512) from VMManager::Initialize and
+#    DebugServer::Stop() from VMManager::Shutdown (see DebugServer.h).
+
+# 5. Configure + build (Release)
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
+cmake --build build --target pcsx2-qt
+```
+
+> On macOS the listener still binds `127.0.0.1:21512`; the MCP server connects the same way as on
+> Windows. No code changes to the plugin or the Node server are required.
 
 ### MCP Server
 

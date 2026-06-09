@@ -406,7 +406,7 @@ namespace DebugServer
 			for (int i = 0; i < len; i++)
 			{
 				bool valid = true;
-				u32 byte = cpu->read8(addr + i, valid);
+				u32 byte = cpu->Read8(addr + i, &valid);
 				if (!valid) byte = 0;
 				char hb[4];
 				snprintf(hb, sizeof(hb), "%02x", byte & 0xFF);
@@ -424,7 +424,7 @@ namespace DebugServer
 			for (size_t i = 0; i + 1 < hexData.size(); i += 2)
 			{
 				u8 byte = (u8)strtoul(hexData.substr(i, 2).c_str(), nullptr, 16);
-				cpu->write8(addr + written, byte);
+				cpu->Write8(addr + written, byte);
 				written++;
 			}
 			j.startObject();
@@ -449,7 +449,7 @@ namespace DebugServer
 				if (!cpu->isValidAddress(pc)) break;
 
 				bool valid = true;
-				u32 opcode = cpu->read32(pc, valid);
+				u32 opcode = cpu->Read32(pc, &valid);
 
 				j.startObject();
 				j.key("address"); j.valHex32(pc);
@@ -671,7 +671,7 @@ namespace DebugServer
 			j.kv("in_bios", inBios);
 
 			bool valid = true;
-			u32 opcode = cpu->read32(newPc, valid);
+			u32 opcode = cpu->Read32(newPc, &valid);
 			j.key("opcode"); j.valHex32(opcode);
 			j.endObject();
 		}
@@ -684,7 +684,7 @@ namespace DebugServer
 			CBreakPoints::SetSkipFirst(getBpCpu(cpuName), pc);
 
 			bool valid = true;
-			u32 opcode = cpu->read32(pc, valid);
+			u32 opcode = cpu->Read32(pc, &valid);
 			u32 op = (opcode >> 26) & 63;
 
 			u32 bpAddr = pc + 8; // default: skip instruction + delay slot
@@ -767,19 +767,17 @@ namespace DebugServer
 
 			// Find the running thread to get entry point and stack top
 			u32 threadEntry = 0;
-			u32 threadStackTop = 0;
 			auto threads = cpu->GetThreadList();
 			for (const auto& t : threads)
 			{
 				if (t->Status() == ThreadStatus::THS_RUN)
 				{
 					threadEntry = t->EntryPoint();
-					threadStackTop = t->StackTop();
 					break;
 				}
 			}
 
-			auto frames = MipsStackWalk::Walk(cpu, pc, ra, sp, threadEntry, threadStackTop);
+			auto frames = MipsStackWalk::Walk(cpu, pc, ra, sp, threadEntry);
 
 			j.startObject();
 			j.kv("ok", true);
@@ -821,7 +819,7 @@ namespace DebugServer
 			for (int i = 0; i < maxLen; i++)
 			{
 				bool valid = true;
-				u32 byte = cpu->read8(addr + i, valid);
+				u32 byte = cpu->Read8(addr + i, &valid);
 				if (!valid || byte == 0) break;
 				str += (char)byte;
 			}

@@ -25,7 +25,10 @@ import * as path from 'node:path';
 let debugServer: DebugServerClient | null = null;
 let pine: PineClient | null = null;
 const memSnapshots = new Map<string, { addr: number; data: Buffer }>();
-const PS2RECOMP_ROOT = process.env.PS2RECOMP_ROOT || 'E:\\Programmi VARI\\PROGETTI\\PS2Recomp';
+// Path to your local PS2Recomp project (for the ps2recomp_* tools).
+// Set the PS2RECOMP_ROOT env var (e.g. in your MCP config's "env" block) to enable them.
+// Left empty by default; the tools guard on existsSync and degrade gracefully when unset.
+const PS2RECOMP_ROOT = process.env.PS2RECOMP_ROOT || '';
 
 // ===== Helpers =====
 function parseAddr(s: string): number { return parseInt(s.replace(/^0x/i, ''), 16); }
