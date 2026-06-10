@@ -381,4 +381,54 @@ export class DebugServerClient {
     const resp = await this.send({ cmd: 'clear_breakpoints' });
     if (!resp.ok) throw new Error(resp.error);
   }
+
+  // ===== Pad Input Injection =====
+  // Buttons use the standard PS2 libpad bit order:
+  //   0x0001 SELECT  0x0002 L3      0x0004 R3      0x0008 START
+  //   0x0010 UP      0x0020 RIGHT   0x0040 DOWN    0x0080 LEFT
+  //   0x0100 L2      0x0200 R2      0x0400 L1      0x0800 R1
+  //   0x1000 TRIANGLE 0x2000 CIRCLE 0x4000 CROSS   0x8000 SQUARE
+
+  /** Hold a controller state (buttons + sticks) until cleared. */
+  async padSet(options: { buttons?: number; lx?: number; ly?: number; rx?: number; ry?: number; port?: number; clear?: boolean }): Promise<any> {
+    const resp = await this.send({ cmd: 'pad_set', ...options });
+    if (!resp.ok) throw new Error(resp.error);
+    return resp;
+  }
+
+  /** Tap buttons (and optionally deflect sticks) for N frames, then release. */
+  async padPress(buttons: number, frames = 12, options?: { lx?: number; ly?: number; rx?: number; ry?: number; port?: number }): Promise<any> {
+    const resp = await this.send({ cmd: 'pad_press', buttons, frames, ...options });
+    if (!resp.ok) throw new Error(resp.error);
+    return resp;
+  }
+
+  // ===== Polled Watchpoints (watch_change) =====
+  // Server-side polling that auto-pauses the VM when a value changes.
+  // Substitute for recompiler breakpoints that don't fire on arm64.
+
+  /** Add a polled watch. Returns the watch id. */
+  async watchChange(address: string, size: 1 | 2 | 4 = 4, intervalMs = 5, description?: string, cpu: CpuTarget = 'ee'): Promise<number> {
+    const resp = await this.send({ cmd: 'watch_change', cpu, address, size, interval_ms: intervalMs, description });
+    if (!resp.ok) throw new Error(resp.error);
+    return resp.id;
+  }
+
+  /** List polled watches and their trigger status (old/new value + cycle). */
+  async watchList(): Promise<Array<{
+    id: number; cpu: string; address: string; size: number; interval_ms: number;
+    armed: boolean; value?: string; triggered: boolean; change_count: number;
+    old_value?: string; new_value?: string; cycle?: number; description?: string;
+  }>> {
+    const resp = await this.send({ cmd: 'watch_list' });
+    if (!resp.ok) throw new Error(resp.error);
+    return resp.watches;
+  }
+
+  /** Remove one polled watch by id, or all when id is omitted. Returns removed count. */
+  async watchClear(id?: number): Promise<number> {
+    const resp = await this.send(id !== undefined ? { cmd: 'watch_clear', id } : { cmd: 'watch_clear' });
+    if (!resp.ok) throw new Error(resp.error);
+    return resp.removed;
+  }
 }

@@ -42,7 +42,11 @@ typedef int socket_t;
 #include "DebugInterface.h"
 #include "Breakpoints.h"
 #include "MipsStackWalk.h"
+#include "SIO/Pad/Pad.h"
+#include "SIO/Pad/PadBase.h"
+#include "SIO/Pad/PadDualshock2.h"
 
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -289,6 +293,129 @@ namespace DebugServer
 		if (name == "iop" || name == "r3000" || name == "IOP")
 			return BREAKPOINT_IOP;
 		return BREAKPOINT_EE;
+	}
+
+	// ============================================================
+	// Pad Input Injection (pad_set / pad_press)
+	// ============================================================
+	// The server thread only mutates this state under s_padMutex and flips
+	// s_padInjectActive. The actual pad writes happen on the CPU/EE thread in
+	// OnVSync(), at the same layer InputRecording uses (SetRawPressureButton /
+	// SetRawAnalogs on Pad::GetPad(port)) — i.e. above SIO2, so the game reads
+	// injected input from the next pad poll exactly like real input.
+	//
+	// Button mask uses the standard PS2 libpad bit order:
+	//   0x0001 SELECT  0x0002 L3      0x0004 R3      0x0008 START
+	//   0x0010 UP      0x0020 RIGHT   0x0040 DOWN    0x0080 LEFT
+	//   0x0100 L2      0x0200 R2      0x0400 L1      0x0800 R1
+	//   0x1000 TRIANGLE 0x2000 CIRCLE 0x4000 CROSS   0x8000 SQUARE
+
+	struct PadInjectState
+	{
+		int port = 0; // unified slot (0 = port 1)
+
+		// Base hold (pad_set): applied until cleared.
+		bool holdActive = false;
+		u32 holdButtons = 0;
+		u8 holdLx = 0x7f, holdLy = 0x7f, holdRx = 0x7f, holdRy = 0x7f;
+
+		// Timed press (pad_press): OR'd on top of the base hold for N frames.
+		bool pressActive = false;
+		u32 pressButtons = 0;
+		bool pressHasAnalogs = false;
+		u8 pressLx = 0x7f, pressLy = 0x7f, pressRx = 0x7f, pressRy = 0x7f;
+		int pressFramesRemaining = 0;
+
+		u64 framesApplied = 0; // diagnostic: total vsyncs this state was applied
+	};
+
+	static std::mutex s_padMutex;
+	static PadInjectState s_pad;
+	// True while OnVSync has work to do (any hold/press active, or a final
+	// release frame still pending). Checked lock-free on the hot path.
+	static std::atomic<bool> s_padInjectActive{false};
+
+	// Map libpad mask bit index (0..15) -> PadDualshock2 input index.
+	static constexpr u32 s_maskBitToInput[16] = {
+		PadDualshock2::Inputs::PAD_SELECT, // 0x0001
+		PadDualshock2::Inputs::PAD_L3, // 0x0002
+		PadDualshock2::Inputs::PAD_R3, // 0x0004
+		PadDualshock2::Inputs::PAD_START, // 0x0008
+		PadDualshock2::Inputs::PAD_UP, // 0x0010
+		PadDualshock2::Inputs::PAD_RIGHT, // 0x0020
+		PadDualshock2::Inputs::PAD_DOWN, // 0x0040
+		PadDualshock2::Inputs::PAD_LEFT, // 0x0080
+		PadDualshock2::Inputs::PAD_L2, // 0x0100
+		PadDualshock2::Inputs::PAD_R2, // 0x0200
+		PadDualshock2::Inputs::PAD_L1, // 0x0400
+		PadDualshock2::Inputs::PAD_R1, // 0x0800
+		PadDualshock2::Inputs::PAD_TRIANGLE, // 0x1000
+		PadDualshock2::Inputs::PAD_CIRCLE, // 0x2000
+		PadDualshock2::Inputs::PAD_CROSS, // 0x4000
+		PadDualshock2::Inputs::PAD_SQUARE, // 0x8000
+	};
+
+	// CPU thread only. Writes a full controller state (all 16 digital buttons +
+	// both sticks) so injected frames are deterministic regardless of host input.
+	static void applyPadState(PadBase* pad, u32 mask, u8 lx, u8 ly, u8 rx, u8 ry)
+	{
+		for (int bit = 0; bit < 16; bit++)
+		{
+			const bool pressed = (mask >> bit) & 1;
+			pad->SetRawPressureButton(s_maskBitToInput[bit], std::make_tuple(pressed, pressed ? u8(0xFF) : u8(0)));
+		}
+		pad->SetRawAnalogs(std::make_tuple(lx, ly), std::make_tuple(rx, ry));
+	}
+
+	// ============================================================
+	// Polled Watchpoints (watch_change) — substitute for recompiler
+	// breakpoints that don't fire on the arm64 recompiler.
+	// ============================================================
+
+	struct Watch
+	{
+		int id = 0;
+		std::string cpuName = "ee";
+		u32 address = 0;
+		int size = 4; // 1 | 2 | 4
+		int intervalMs = 5;
+		std::string description;
+
+		bool armed = false; // first read taken
+		u64 lastValue = 0;
+		std::chrono::steady_clock::time_point nextPoll;
+
+		// Last detected change
+		bool triggered = false;
+		u64 oldValue = 0;
+		u64 newValue = 0;
+		u64 cycleAtChange = 0;
+		u64 changeCount = 0;
+	};
+
+	static std::mutex s_watchMutex;
+	static std::vector<Watch> s_watches;
+	static int s_nextWatchId = 1;
+	static std::atomic<bool> s_watchThreadRunning{false};
+	static constexpr size_t MAX_WATCHES = 64;
+
+	static u64 readWatchValue(DebugInterface* cpu, u32 addr, int size, bool* valid)
+	{
+		switch (size)
+		{
+			case 1: return cpu->Read8(addr, valid);
+			case 2: return cpu->Read16(addr, valid);
+			default: return cpu->Read32(addr, valid);
+		}
+	}
+
+	static void watchThreadLoop();
+
+	static void ensureWatchThread()
+	{
+		bool expected = false;
+		if (s_watchThreadRunning.compare_exchange_strong(expected, true))
+			std::thread(watchThreadLoop).detach();
 	}
 
 	// ============================================================
@@ -839,6 +966,191 @@ namespace DebugServer
 			j.kv("ok", true);
 			j.endObject();
 		}
+		// ----- PAD SET (hold until cleared) -----
+		else if (cmd == "pad_set")
+		{
+			const bool clear = getBool(params, "clear", false);
+			const int port = (int)getNum(params, "port", 0);
+
+			std::lock_guard<std::mutex> lock(s_padMutex);
+			if (clear)
+			{
+				s_pad.holdActive = false;
+				s_pad.pressActive = false;
+				// Leave s_padInjectActive set — OnVSync applies one final
+				// release frame (all buttons up, sticks neutral) and then
+				// deactivates, returning control to host input.
+			}
+			else
+			{
+				s_pad.port = port;
+				s_pad.holdActive = true;
+				s_pad.holdButtons = (u32)getNum(params, "buttons", 0) & 0xFFFF;
+				s_pad.holdLx = (u8)getNum(params, "lx", 0x7f);
+				s_pad.holdLy = (u8)getNum(params, "ly", 0x7f);
+				s_pad.holdRx = (u8)getNum(params, "rx", 0x7f);
+				s_pad.holdRy = (u8)getNum(params, "ry", 0x7f);
+				s_pad.framesApplied = 0;
+			}
+			s_padInjectActive.store(true, std::memory_order_release);
+
+			j.startObject();
+			j.kv("ok", true);
+			j.kv("holding", !clear);
+			if (!clear)
+			{
+				j.key("buttons"); j.valHex32(s_pad.holdButtons);
+				j.kv("lx", (int64_t)s_pad.holdLx);
+				j.kv("ly", (int64_t)s_pad.holdLy);
+				j.kv("rx", (int64_t)s_pad.holdRx);
+				j.kv("ry", (int64_t)s_pad.holdRy);
+			}
+			j.kv("note", "applied on next vsync; VM must be running");
+			j.endObject();
+		}
+		// ----- PAD PRESS (hold N frames, then release) -----
+		else if (cmd == "pad_press")
+		{
+			const u32 buttons = (u32)getNum(params, "buttons", 0) & 0xFFFF;
+			int frames = (int)getNum(params, "frames", 12);
+			if (frames < 1) frames = 1;
+			if (frames > 3600) frames = 3600;
+			const int port = (int)getNum(params, "port", 0);
+
+			{
+				std::lock_guard<std::mutex> lock(s_padMutex);
+				s_pad.port = port;
+				s_pad.pressActive = true;
+				s_pad.pressButtons = buttons;
+				s_pad.pressFramesRemaining = frames;
+				s_pad.pressHasAnalogs =
+					params.count("lx") || params.count("ly") || params.count("rx") || params.count("ry");
+				s_pad.pressLx = (u8)getNum(params, "lx", 0x7f);
+				s_pad.pressLy = (u8)getNum(params, "ly", 0x7f);
+				s_pad.pressRx = (u8)getNum(params, "rx", 0x7f);
+				s_pad.pressRy = (u8)getNum(params, "ry", 0x7f);
+				s_padInjectActive.store(true, std::memory_order_release);
+			}
+
+			j.startObject();
+			j.kv("ok", true);
+			j.key("buttons"); j.valHex32(buttons);
+			j.kv("frames", (int64_t)frames);
+			j.kv("note", "press is applied over the next N vsyncs, then released; VM must be running");
+			j.endObject();
+		}
+		// ----- WATCH CHANGE (server-side polled watchpoint) -----
+		else if (cmd == "watch_change")
+		{
+			u32 addr = (u32)getNum(params, "address", 0);
+			int size = (int)getNum(params, "size", 4);
+			if (size != 1 && size != 2 && size != 4) size = 4;
+			int intervalMs = (int)getNum(params, "interval_ms", 5);
+			if (intervalMs < 1) intervalMs = 1;
+			if (intervalMs > 1000) intervalMs = 1000;
+			std::string desc = getStr(params, "description", "");
+
+			bool added = false;
+			int id = 0;
+			{
+				std::lock_guard<std::mutex> lock(s_watchMutex);
+				if (s_watches.size() < MAX_WATCHES)
+				{
+					Watch w;
+					w.id = s_nextWatchId++;
+					w.cpuName = cpuName;
+					w.address = addr;
+					w.size = size;
+					w.intervalMs = intervalMs;
+					w.description = desc;
+					w.nextPoll = std::chrono::steady_clock::now();
+					s_watches.push_back(std::move(w));
+					id = s_watches.back().id;
+					added = true;
+				}
+			}
+
+			if (added)
+				ensureWatchThread();
+
+			j.startObject();
+			j.kv("ok", added);
+			if (added)
+			{
+				j.kv("id", (int64_t)id);
+				j.key("address"); j.valHex32(addr);
+				j.kv("size", (int64_t)size);
+				j.kv("interval_ms", (int64_t)intervalMs);
+				j.kv("note", "VM auto-pauses when the value changes; poll watch_list for old/new/cycle");
+			}
+			else
+			{
+				j.kv("error", "Too many watches (max 64)");
+			}
+			j.endObject();
+		}
+		// ----- WATCH LIST -----
+		else if (cmd == "watch_list")
+		{
+			std::lock_guard<std::mutex> lock(s_watchMutex);
+			j.startObject();
+			j.kv("ok", true);
+			j.key("watches"); j.startArray();
+			for (const auto& w : s_watches)
+			{
+				j.startObject();
+				j.kv("id", (int64_t)w.id);
+				j.kv("cpu", w.cpuName);
+				j.key("address"); j.valHex32(w.address);
+				j.kv("size", (int64_t)w.size);
+				j.kv("interval_ms", (int64_t)w.intervalMs);
+				j.kv("armed", w.armed);
+				if (w.armed)
+				{
+					j.key("value"); j.valHex32((u32)w.lastValue);
+				}
+				j.kv("triggered", w.triggered);
+				j.kv("change_count", w.changeCount);
+				if (w.triggered)
+				{
+					j.key("old_value"); j.valHex32((u32)w.oldValue);
+					j.key("new_value"); j.valHex32((u32)w.newValue);
+					j.kv("cycle", w.cycleAtChange);
+				}
+				if (!w.description.empty())
+					j.kv("description", w.description);
+				j.endObject();
+			}
+			j.endArray();
+			j.endObject();
+		}
+		// ----- WATCH CLEAR -----
+		else if (cmd == "watch_clear")
+		{
+			const int id = (int)getNum(params, "id", -1);
+			size_t removed = 0;
+			{
+				std::lock_guard<std::mutex> lock(s_watchMutex);
+				if (id < 0)
+				{
+					removed = s_watches.size();
+					s_watches.clear();
+				}
+				else
+				{
+					const size_t before = s_watches.size();
+					s_watches.erase(
+						std::remove_if(s_watches.begin(), s_watches.end(),
+							[id](const Watch& w) { return w.id == id; }),
+						s_watches.end());
+					removed = before - s_watches.size();
+				}
+			}
+			j.startObject();
+			j.kv("ok", true);
+			j.kv("removed", (int64_t)removed);
+			j.endObject();
+		}
 		// ----- UNKNOWN COMMAND -----
 		else
 		{
@@ -854,7 +1166,9 @@ namespace DebugServer
 				"set_memcheck", "remove_memcheck", "list_memchecks",
 				"pause", "resume", "step", "step_over",
 				"get_threads", "get_modules",
-				"is_valid_address", "clear_breakpoints"
+				"is_valid_address", "clear_breakpoints",
+				"pad_set", "pad_press",
+				"watch_change", "watch_list", "watch_clear"
 			};
 			for (const char* c : cmds) j.valStr(c);
 			j.endArray();
@@ -868,6 +1182,118 @@ namespace DebugServer
 	// TCP Server
 	// ============================================================
 	static std::atomic<bool> s_running{false};
+
+	// ============================================================
+	// Watch poller thread — reads watched addresses from the server
+	// side and auto-pauses the VM when a value changes.
+	// ============================================================
+	static void watchThreadLoop()
+	{
+		while (s_running.load())
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+			const auto now = std::chrono::steady_clock::now();
+			std::lock_guard<std::mutex> lock(s_watchMutex);
+			for (auto& w : s_watches)
+			{
+				if (now < w.nextPoll)
+					continue;
+				w.nextPoll = now + std::chrono::milliseconds(w.intervalMs);
+
+				DebugInterface* cpu = getCpu(w.cpuName);
+				if (!cpu->isAlive())
+					continue;
+
+				bool valid = true;
+				const u64 value = readWatchValue(cpu, w.address, w.size, &valid);
+				if (!valid)
+					continue;
+
+				if (!w.armed)
+				{
+					w.armed = true;
+					w.lastValue = value;
+					continue;
+				}
+
+				if (value != w.lastValue)
+				{
+					w.triggered = true;
+					w.oldValue = w.lastValue;
+					w.newValue = value;
+					w.cycleAtChange = cpu->getCycles();
+					w.changeCount++;
+					w.lastValue = value;
+
+					if (!cpu->isCpuPaused())
+					{
+						cpu->pauseCpu();
+						fprintf(stderr,
+							"[DebugServer] watch #%d: 0x%08x changed 0x%llx -> 0x%llx (cycle %llu), VM paused\n",
+							w.id, w.address,
+							(unsigned long long)w.oldValue, (unsigned long long)w.newValue,
+							(unsigned long long)w.cycleAtChange);
+					}
+				}
+			}
+		}
+
+		s_watchThreadRunning.store(false);
+	}
+
+	// ============================================================
+	// Per-frame pad injection — runs on the CPU/EE thread, called
+	// from VMManager::Internal::VSyncOnCPUThread().
+	// ============================================================
+	void OnVSync()
+	{
+		if (!s_padInjectActive.load(std::memory_order_acquire))
+			return;
+
+		std::lock_guard<std::mutex> lock(s_padMutex);
+
+		PadBase* pad = Pad::GetPad((u8)(s_pad.port & 0x7));
+		if (!pad || pad->GetType() != Pad::ControllerType::DualShock2)
+			return; // not a DS2 (or not ready yet) — keep state pending
+
+		if (s_pad.holdActive || s_pad.pressActive)
+		{
+			u32 buttons = s_pad.holdActive ? s_pad.holdButtons : 0;
+			u8 lx = s_pad.holdActive ? s_pad.holdLx : u8(0x7f);
+			u8 ly = s_pad.holdActive ? s_pad.holdLy : u8(0x7f);
+			u8 rx = s_pad.holdActive ? s_pad.holdRx : u8(0x7f);
+			u8 ry = s_pad.holdActive ? s_pad.holdRy : u8(0x7f);
+
+			if (s_pad.pressActive)
+			{
+				buttons |= s_pad.pressButtons;
+				if (s_pad.pressHasAnalogs)
+				{
+					lx = s_pad.pressLx;
+					ly = s_pad.pressLy;
+					rx = s_pad.pressRx;
+					ry = s_pad.pressRy;
+				}
+			}
+
+			applyPadState(pad, buttons, lx, ly, rx, ry);
+			s_pad.framesApplied++;
+
+			if (s_pad.pressActive && --s_pad.pressFramesRemaining <= 0)
+				s_pad.pressActive = false;
+			// If the press just ended and there is no base hold, we stay
+			// active one more frame to emit the release below.
+		}
+		else
+		{
+			// Final release frame: everything up, sticks neutral, then give
+			// control back to host input sources.
+			applyPadState(pad, 0, 0x7f, 0x7f, 0x7f, 0x7f);
+			s_padInjectActive.store(false, std::memory_order_release);
+		}
+	}
+
 	static std::thread s_serverThread;
 	static socket_t s_listenSocket = SOCKET_INVALID;
 
@@ -988,11 +1414,23 @@ namespace DebugServer
 
 	void Stop()
 	{
-		s_running.store(false);
+		s_running.store(false); // also stops the watch poller thread
 		if (s_listenSocket != SOCKET_INVALID)
 		{
 			CLOSE_SOCKET(s_listenSocket);
 			s_listenSocket = SOCKET_INVALID;
+		}
+
+		// Drop any pending pad injection so we don't touch pads during shutdown.
+		{
+			std::lock_guard<std::mutex> lock(s_padMutex);
+			s_pad = PadInjectState();
+		}
+		s_padInjectActive.store(false);
+
+		{
+			std::lock_guard<std::mutex> lock(s_watchMutex);
+			s_watches.clear();
 		}
 	}
 

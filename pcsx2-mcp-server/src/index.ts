@@ -51,7 +51,35 @@ function hexDump(buf: Buffer, base: number): string {
   return lines.join('\n');
 }
 
-function hasDebug(): boolean { return debugServer?.isConnected() ?? false; }  
+// PS2 libpad digital button bit order (bit value = 1 means pressed in our API).
+const PAD_BUTTONS: Record<string, number> = {
+  select: 0x0001, l3: 0x0002, r3: 0x0004, start: 0x0008,
+  up: 0x0010, right: 0x0020, down: 0x0040, left: 0x0080,
+  l2: 0x0100, r2: 0x0200, l1: 0x0400, r1: 0x0800,
+  triangle: 0x1000, circle: 0x2000, cross: 0x4000, x: 0x4000, square: 0x8000,
+};
+
+/** Accepts a number, a hex/decimal string ("0x4000"), or button names ("cross+start", "x,up"). */
+function parseButtons(v: number | string): number {
+  if (typeof v === 'number') return v & 0xFFFF;
+  const s = v.trim().toLowerCase();
+  if (/^(0x)?[0-9a-f]+$/.test(s) && (s.startsWith('0x') || /^\d+$/.test(s)))
+    return (s.startsWith('0x') ? parseInt(s, 16) : parseInt(s, 10)) & 0xFFFF;
+  let mask = 0;
+  for (const name of s.split(/[+,|\s]+/).filter(Boolean)) {
+    const bit = PAD_BUTTONS[name];
+    if (bit === undefined) throw new Error(`Unknown button "${name}" (valid: ${Object.keys(PAD_BUTTONS).join(', ')})`);
+    mask |= bit;
+  }
+  return mask;
+}
+
+function buttonNames(mask: number): string {
+  const names = Object.entries(PAD_BUTTONS).filter(([n, b]) => n !== 'x' && (mask & b)).map(([n]) => n.toUpperCase());
+  return names.length ? names.join('+') : '(none)';
+}
+
+function hasDebug(): boolean { return debugServer?.isConnected() ?? false; }
 function hasPine(): boolean { return pine?.isConnected() ?? false; }
 
 async function readMem(addr: number, len: number): Promise<Buffer> {
@@ -399,6 +427,92 @@ server.tool('pcsx2_pause', 'Pause/halt the emulator. Returns current PC.',
 );
 
 // ==========================================================
+//  TOOL: pcsx2_pad_set / pcsx2_pad_press (CONTROLLER INJECTION!)
+// ==========================================================
+const padButtonsSchema = z.union([z.number().int(), z.string()]).describe(
+  'Buttons to press — PS2 libpad bit mask (SELECT=0x0001, L3=0x0002, R3=0x0004, START=0x0008, UP=0x0010, RIGHT=0x0020, DOWN=0x0040, LEFT=0x0080, L2=0x0100, R2=0x0200, L1=0x0400, R1=0x0800, TRIANGLE=0x1000, CIRCLE=0x2000, CROSS/X=0x4000, SQUARE=0x8000), hex string ("0x4000"), or names ("cross", "x+start", "up,circle")');
+const padAxisSchema = (name: string) => z.number().int().min(0).max(255).optional().describe(`${name} stick axis, 0..255 (128=center)`);
+
+server.tool('pcsx2_pad_set',
+  'HOLD a controller state on pad port 1 until cleared — digital buttons + analog sticks. Injected above SIO2 (same layer as PCSX2\'s input recorder), so the game reads it exactly like real input. Overrides physical input while active. Use clear=true to release everything and return control to the host. VM must be RUNNING (applied once per frame at vsync). Requires DebugServer.',
+  { buttons: padButtonsSchema.optional(), lx: padAxisSchema('Left'), ly: padAxisSchema('Left Y (0=up, 255=down)'), rx: padAxisSchema('Right'), ry: padAxisSchema('Right Y'), port: z.number().int().min(0).max(1).default(0).describe('Pad port (0 = player 1)'), clear: z.boolean().default(false).describe('Release all injected input and return control to host') },
+  async ({ buttons, lx, ly, rx, ry, port, clear }) => {
+    if (!hasDebug()) return { content: [{ type: 'text' as const, text: 'Error: DebugServer not connected.' }], isError: true };
+    try {
+      if (clear) {
+        await debugServer!.padSet({ clear: true, port });
+        return { content: [{ type: 'text' as const, text: 'Pad injection cleared — host input restored (release applied on next vsync).' }] };
+      }
+      const mask = parseButtons(buttons ?? 0);
+      await debugServer!.padSet({ buttons: mask, lx, ly, rx, ry, port });
+      const sticks = [lx, ly, rx, ry].some(v => v !== undefined) ? ` | sticks L(${lx ?? 128},${ly ?? 128}) R(${rx ?? 128},${ry ?? 128})` : '';
+      return { content: [{ type: 'text' as const, text: `Holding ${buttonNames(mask)} (0x${mask.toString(16).padStart(4, '0')})${sticks} on port ${port + 1}.\nApplied every frame from next vsync until pcsx2_pad_set with clear=true. VM must be running.` }] };
+    } catch (e: any) { return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+server.tool('pcsx2_pad_press',
+  'TAP controller buttons on pad port 1 — held for N frames (~60/sec NTSC), then released. E.g. buttons="cross" (or 0x4000), frames=12 ≈ 200ms tap of X. Layered on top of any pcsx2_pad_set hold (buttons are OR\'d; analogs, if given, override for the press duration). Injected above SIO2 like real input. VM must be RUNNING — frames only tick while the game runs. Requires DebugServer.',
+  { buttons: padButtonsSchema, frames: z.number().int().min(1).max(3600).default(12).describe('How many frames to hold before releasing (12 ≈ 200ms at 60fps)'), lx: padAxisSchema('Left'), ly: padAxisSchema('Left Y (0=up, 255=down)'), rx: padAxisSchema('Right'), ry: padAxisSchema('Right Y'), port: z.number().int().min(0).max(1).default(0).describe('Pad port (0 = player 1)') },
+  async ({ buttons, frames, lx, ly, rx, ry, port }) => {
+    if (!hasDebug()) return { content: [{ type: 'text' as const, text: 'Error: DebugServer not connected.' }], isError: true };
+    try {
+      const mask = parseButtons(buttons);
+      if (mask === 0) return { content: [{ type: 'text' as const, text: 'Error: empty button mask' }], isError: true };
+      await debugServer!.padPress(mask, frames, { lx, ly, rx, ry, port });
+      return { content: [{ type: 'text' as const, text: `Pressing ${buttonNames(mask)} (0x${mask.toString(16).padStart(4, '0')}) for ${frames} frames (~${Math.round(frames / 60 * 1000)}ms) on port ${port + 1}, then releasing.\nThe press plays out over the next ${frames} vsyncs — the VM must be running.` }] };
+    } catch (e: any) { return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+// ==========================================================
+//  TOOL: pcsx2_watch_change (+ list / clear) — POLLED WATCHPOINTS
+// ==========================================================
+server.tool('pcsx2_watch_change',
+  'Watch a memory address and AUTO-PAUSE the VM when its value changes (records old/new value + EE cycle). Server-side polling — works where recompiler breakpoints/memchecks don\'t fire (arm64 recompiler). After it triggers, use pcsx2_watch_list to read old→new, then pcsx2_get_backtrace / pcsx2_read_registers to inspect. Requires DebugServer.',
+  { address: z.string().describe('Address to watch, e.g. "0x00345a80"'), size: z.union([z.literal(1), z.literal(2), z.literal(4)]).default(4).describe('Value size in bytes'), interval_ms: z.number().int().min(1).max(1000).default(5).describe('Polling interval in milliseconds'), description: z.string().optional().describe('Optional label shown in pcsx2_watch_list') },
+  async ({ address, size, interval_ms, description }) => {
+    if (!hasDebug()) return { content: [{ type: 'text' as const, text: 'Error: DebugServer not connected.' }], isError: true };
+    try {
+      const id = await debugServer!.watchChange(address, size, interval_ms, description);
+      return { content: [{ type: 'text' as const, text: `Watch #${id} armed: ${address} (${size}B, every ${interval_ms}ms)${description ? ` — ${description}` : ''}\nVM pauses automatically on change. Check pcsx2_watch_list for trigger status.` }] };
+    } catch (e: any) { return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+server.tool('pcsx2_watch_list',
+  'List polled change-watches (from pcsx2_watch_change) with current value, trigger status, old→new values, change count, and the EE cycle of the last change.',
+  {},
+  async () => {
+    if (!hasDebug()) return { content: [{ type: 'text' as const, text: 'Error: DebugServer not connected.' }], isError: true };
+    try {
+      const watches = await debugServer!.watchList();
+      if (watches.length === 0) return { content: [{ type: 'text' as const, text: 'No change-watches set.' }] };
+      const lines = watches.map(w => {
+        let s = `#${w.id} ${w.address} (${w.size}B, ${w.interval_ms}ms)`;
+        s += w.armed ? ` value=${w.value}` : ' (not yet read)';
+        if (w.triggered) s += ` 🔔 CHANGED ${w.old_value} → ${w.new_value} @ cycle ${w.cycle} (${w.change_count} change(s))`;
+        if (w.description) s += ` — ${w.description}`;
+        return s;
+      });
+      return { content: [{ type: 'text' as const, text: `${watches.length} watch(es):\n${lines.join('\n')}` }] };
+    } catch (e: any) { return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+server.tool('pcsx2_watch_clear',
+  'Remove a polled change-watch by id, or ALL watches when id is omitted.',
+  { id: z.number().int().optional().describe('Watch id from pcsx2_watch_change/pcsx2_watch_list; omit to clear all') },
+  async ({ id }) => {
+    if (!hasDebug()) return { content: [{ type: 'text' as const, text: 'Error: DebugServer not connected.' }], isError: true };
+    try {
+      const removed = await debugServer!.watchClear(id);
+      return { content: [{ type: 'text' as const, text: `Removed ${removed} watch(es).` }] };
+    } catch (e: any) { return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+// ==========================================================
 //  TOOL: pcsx2_get_threads / pcsx2_get_modules
 // ==========================================================
 server.tool('pcsx2_get_threads', 'List EE/IOP BIOS threads with their status.',
@@ -595,7 +709,7 @@ server.resource('ps2_memory_map', 'ps2://memory_map', async () => ({
 }));
 
 server.resource('debug_protocol', 'ps2://debug_protocol', async () => ({
-  contents: [{ uri: 'ps2://debug_protocol', mimeType: 'text/plain', text: `PCSX2 Debug Server Protocol (port 21512)\nNewline-delimited JSON over TCP\n\nCommands: status, read_registers, write_register, set_pc, read_memory, write_memory, read_string, disassemble, evaluate, set_breakpoint, remove_breakpoint, list_breakpoints, set_memcheck, remove_memcheck, list_memchecks, pause, resume, step, step_over, get_threads, get_modules, is_valid_address, clear_breakpoints\n\nRequest:  {"cmd":"read_registers","cpu":"ee","category":0}\\n\nResponse: {"ok":true,"data":{...}}\\n` }]
+  contents: [{ uri: 'ps2://debug_protocol', mimeType: 'text/plain', text: `PCSX2 Debug Server Protocol (port 21512)\nNewline-delimited JSON over TCP\n\nCommands: status, read_registers, write_register, set_pc, read_memory, write_memory, read_string, disassemble, evaluate, set_breakpoint, remove_breakpoint, list_breakpoints, set_memcheck, remove_memcheck, list_memchecks, pause, resume, step, step_over, get_threads, get_modules, is_valid_address, clear_breakpoints, pad_set, pad_press, watch_change, watch_list, watch_clear\n\nRequest:  {"cmd":"read_registers","cpu":"ee","category":0}\\n\nResponse: {"ok":true,"data":{...}}\\n` }]
 }));
 
 // ===== MAIN =====

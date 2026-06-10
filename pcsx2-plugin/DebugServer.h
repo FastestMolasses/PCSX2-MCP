@@ -37,4 +37,10 @@ namespace DebugServer
 	// Called when a breakpoint is hit — wakes up any waiting step/continue
 	void OnBreakpointHit();
 
+	// Called once per frame from the CPU/EE thread (VMManager::Internal::VSyncOnCPUThread).
+	// Applies pending controller-input injection (pad_set / pad_press commands) to the
+	// pad state at the same layer the input recorder uses, so the game sees it as real
+	// input on the next SIO2 poll. Near-zero cost when no injection is active.
+	void OnVSync();
+
 } // namespace DebugServer
